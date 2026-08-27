@@ -96,10 +96,11 @@ MOET_PROFILE=resident scripts/serve-glm53-moet.sh
 ```
 
 Important overrides include `BASE_IMAGE` and `IMAGE` for the build script,
-`IMAGE`, `MODEL_PATH`, `HF_CACHE`, `PLANES_CACHE`, `MOE_STORE`,
-`BASE_CACHE_GB`, `BASE_RAM_GB`, `GPU_MEM_UTIL`, `MAX_BATCHED_TOKENS`,
-`PORT`, and `ENFORCE_EAGER=0` for the serve script. Additional vLLM arguments
-may be appended to the serve script.
+`IMAGE`, `MODEL_PATH`, `REVISION`, `MODEL_IDENTITY`, `HF_CACHE`,
+`PLANES_CACHE`, `MOE_STORE`, `BASE_CACHE_GB`, `BASE_RAM_GB`,
+`GPU_MEM_UTIL`, `MAX_BATCHED_TOKENS`, `PORT`, and `ENFORCE_EAGER=0` for
+the serve script. Additional vLLM arguments may be appended to the serve
+script.
 
 Use at least 192 GiB of system RAM for the cache profile and first conversion.
 Use a fast, bind-mounted ext4 or xfs filesystem, not container overlay storage,
@@ -107,6 +108,79 @@ with at least 500 GiB free for the checkpoint, W2 and FP4 packs, caches, and
 operational headroom. First boot performs conversion and pack creation. Later
 boots reuse packs only when checkpoint identity, revision, TP rank, geometry,
 and quantizer metadata match.
+
+## Serving a local model directory
+
+By default the script serves the pinned remote repository
+(`dealignai/GLM-5.3-Flash-ABLITERATED-NVFP4` at revision
+`835b767e640aeaace97bd9d8b6d4ddecd9d8e9d4`). To run from a model that is
+already downloaded on the host, set `MODEL_PATH` to its directory. The script
+resolves the path, bind-mounts it read-only at `/model` inside the container,
+passes `/model` as the model argument, and omits `--revision` (a revision
+only applies to remote repositories):
+
+```bash
+MODEL_PATH=/home/hal/models/GLM-5.3-Flash-NVFP4a MODEL_IDENTITY=glm53-nvfp4a-v1 scripts/serve-glm53-moet.sh
+```
+
+The mount is read-only (`:ro`), so the container never mutates your host
+files, and paths containing spaces are passed as a single argument. Any
+`MODEL_PATH` that names an existing host directory is treated as a local
+model, including a bare relative path such as `models/glm`. A `MODEL_PATH`
+beginning with `/`, `./`, `../`, or `~` that does not exist on the host
+fails before `docker run` is invoked; any other value must be a valid one-
+or two-component Hugging Face repo ID.
+
+Passing a host path directly (without a mount) does not work: the container
+does not contain `/home/hal/models/GLM-5.3-Flash-NVFP4a`, so vLLM raises
+`HFValidationError` ("does not exist"). The wrapper's bind mount is what
+makes the path visible in-container.
+
+### Direct image usage
+
+Without the wrapper, mount the model and pass the in-container path yourself:
+
+```bash
+docker run --rm --gpus all --ipc=host --shm-size 64g \
+  -p 127.0.0.1:8000:8000 \
+  -v /home/hal/models/GLM-5.3-Flash-NVFP4a:/model:ro \
+  -e VLLM_MOE_W2_CKPT_ID=glm53-nvfp4a-v1 \
+  ghcr.io/sepffuzzball/vllm-glm53-moet:latest \
+  /model --tensor-parallel-size 2 --quantization modelopt --moe-backend marlin \
+  --kv-cache-dtype fp8 --max-model-len 32768 --max-num-seqs 1 \
+  --reasoning-parser glm45 --tool-call-parser glm47 --enable-auto-tool-choice
+```
+
+### HF cache snapshots
+
+If the model directory lives inside the HF cache (for example
+`$HF_CACHE/hub/models--dealignai--GLM-5.3-Flash-ABLITERATED-NVFP4/snapshots/<commit>`),
+the wrapper instead mounts the whole cache read-only at `/model-hf-cache` and
+passes the snapshot's path under it. Snapshot entries are symlinks into
+`blobs/`; mounting the entire cache keeps those symlinks valid inside the
+container.
+
+### Checkpoint identity
+
+`VLLM_MOE_W2_CKPT_ID` names the persisted MoET pack. It is set only for
+local model directories:
+
+- Local HF snapshot whose final directory name is a 40-hex commit: that
+  commit, unless `MODEL_IDENTITY` is set.
+- Any other local directory: `MODEL_IDENTITY` if set; otherwise the
+  variable is omitted and the runtime derives a local metadata
+  fingerprint on first load.
+
+Remote repositories do not set `VLLM_MOE_W2_CKPT_ID`: the runtime uses
+Hugging Face's resolved commit hash (from the `--revision` still passed on
+the command line) as the checkpoint identity, so persistent pack reuse keys
+on the exact snapshot Hugging Face actually resolved.
+
+The wrapper warns when a local path is used without a usable identity (no
+`MODEL_IDENTITY` and no 40-hex snapshot commit). Set `MODEL_IDENTITY` to an
+immutable artifact ID (for example `glm53-nvfp4a-v1`) so persistent pack
+reuse keys on a stable value; the pinned remote revision is never reused for
+a local directory.
 
 ## Phase-one boundary
 

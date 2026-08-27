@@ -9,7 +9,8 @@ set -euo pipefail
 
 IMAGE="${IMAGE:-glm53-moet:local}"
 MODEL_PATH="${MODEL_PATH:-dealignai/GLM-5.3-Flash-ABLITERATED-NVFP4}"
-REVISION="835b767e640aeaace97bd9d8b6d4ddecd9d8e9d4"
+REVISION="${REVISION:-835b767e640aeaace97bd9d8b6d4ddecd9d8e9d4}"
+MODEL_IDENTITY="${MODEL_IDENTITY:-}"
 MOET_PROFILE="${MOET_PROFILE:-cache}"
 
 HF_CACHE="${HF_CACHE:-$HOME/.cache/huggingface}"
@@ -40,9 +41,68 @@ case "${ENFORCE_EAGER}" in
         ;;
 esac
 
+# Classify MODEL_PATH. An existing host directory is bind-mounted read-only
+# and passed as its in-container path (with no --revision); a repo ID is
+# passed unchanged with --revision.
+model_mounts=()
+model_argv=()
+ckpt_id=""
+
+# Expand a leading ~ so the existence check works for tilde paths.
+model_path_host="${MODEL_PATH}"
+if [[ "${model_path_host}" == "~" ]]; then
+    model_path_host="${HOME}"
+elif [[ "${model_path_host}" == "~/"* ]]; then
+    model_path_host="${HOME}/${model_path_host:2}"
+fi
+
+if [[ -d "${model_path_host}" ]]; then
+    # Existing host directory (including a bare relative path like models/glm).
+    model_real="$(realpath -e -- "${model_path_host}")"
+
+    hf_cache_real=""
+    if hf_cache_real_tmp="$(realpath -e -- "${HF_CACHE}" 2>/dev/null)"; then
+        hf_cache_real="${hf_cache_real_tmp}"
+    fi
+
+    if [[ -n "${hf_cache_real}" ]] && [[ "${model_real}" == "${hf_cache_real}"/* ]]; then
+        # HF cache snapshot: mount the whole cache so snapshot-to-blob
+        # symlinks remain valid inside the container.
+        model_mounts+=(-v "${HF_CACHE}:/model-hf-cache:ro")
+        model_rel="${model_real#"${hf_cache_real}"/}"
+        model_argv+=("/model-hf-cache/${model_rel}")
+
+        snapshot_commit="${model_real##*/}"
+        if [[ -z "${MODEL_IDENTITY}" ]] && [[ "${snapshot_commit}" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            ckpt_id="${snapshot_commit}"
+        else
+            ckpt_id="${MODEL_IDENTITY}"
+        fi
+    else
+        model_mounts+=(-v "${model_real}:/model:ro")
+        model_argv+=("/model")
+        ckpt_id="${MODEL_IDENTITY}"
+    fi
+
+    if [[ -z "${ckpt_id}" ]]; then
+        echo "warning: MODEL_IDENTITY is unset; set it to an immutable artifact ID for safe persistent pack reuse" >&2
+    fi
+elif [[ "${MODEL_PATH}" == /* || "${MODEL_PATH}" == ./* || "${MODEL_PATH}" == ../* || "${MODEL_PATH}" == ~* ]]; then
+    echo "error: MODEL_PATH does not exist on the host: '${MODEL_PATH}'" >&2
+    exit 1
+else
+    # Remote Hugging Face repo ID. ckpt_id is intentionally left empty: the
+    # runtime resolves the pinned REVISION to HF's commit hash as identity.
+    if [[ "${MODEL_PATH}" =~ ^[A-Za-z0-9_.-]+(/[A-Za-z0-9_.-]+)?$ ]]; then
+        model_argv+=("${MODEL_PATH}" --revision "${REVISION}")
+    else
+        echo "error: MODEL_PATH is not a valid Hugging Face repo ID or host path: '${MODEL_PATH}'" >&2
+        exit 1
+    fi
+fi
+
 cli=(
-    "${MODEL_PATH}"
-    --revision "${REVISION}"
+    "${model_argv[@]}"
     --tensor-parallel-size 2
     --quantization modelopt
     --moe-backend marlin
@@ -73,6 +133,11 @@ if [[ "${MOET_PROFILE}" == "cache" ]]; then
     )
 fi
 
+ckpt_env=()
+if [[ -n "${ckpt_id}" ]]; then
+    ckpt_env+=(-e "VLLM_MOE_W2_CKPT_ID=${ckpt_id}")
+fi
+
 docker run \
     --rm \
     --gpus all \
@@ -87,12 +152,13 @@ docker run \
     -e VLLM_MOE_W2_CUBIT_DIR=/cubit-share \
     -e VLLM_MOE_W2_KS=4096,1024 \
     -e VLLM_MOE_W2_PLANES_CACHE=/planes-cache \
-    -e VLLM_MOE_W2_CKPT_ID="${REVISION}" \
     -e VLLM_MOE_W2_DELTA=1 \
     -e VLLM_MOE_W2_DELTA_GB=2 \
     -e VLLM_MOE_W2_GATE=0 \
     -e VLLM_MOE_W2_BASE_MISS_TOL=0 \
     -e VLLM_MOE_W2_REPLAY_MODE=strict \
+    "${model_mounts[@]}" \
+    "${ckpt_env[@]}" \
     "${moe_env[@]}" \
     "${IMAGE}" \
     "${cli[@]}"
