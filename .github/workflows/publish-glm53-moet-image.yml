@@ -1,0 +1,89 @@
+name: Publish GLM-5.3 MoET image
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile.glm53-moet'
+      - '.github/workflows/publish-glm53-moet-image.yml'
+      - 'vllm/**'
+      - 'kernels/**'
+      - 'scripts/build-glm53-moet.sh'
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+concurrency:
+  group: publish-glm53-moet-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Free ephemeral runner disk
+        shell: bash
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /usr/share/swift /opt/ghc /usr/local/.ghcup /opt/hostedtoolcache
+          sudo apt-get purge -y -f 'dotnet*' 'ghc*' 'boost*' >/dev/null 2>&1 || true
+          docker system prune -af
+          docker builder prune -af
+          df -h /
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute image tags and labels
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=sha,prefix=sha-,format=short
+            type=ref,event=tag
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: Build and push image
+        id: build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          file: Dockerfile.glm53-moet
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=min
+
+      - name: Write GHCR publication notice
+        shell: bash
+        run: |
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## GHCR publication notice
+
+          The image was pushed to GHCR. Your first publication is private by
+          GitHub design. To make the package public, open this URL once and
+          choose Change visibility -> Public:
+          https://github.com/users/${{ github.repository_owner }}/packages/container/${{ github.event.repository.name }}/settings
+
+          Subsequent tags pushed by this workflow remain public after the first
+          one-time change.
+          EOF

@@ -18,10 +18,45 @@ scripts/build-glm53-moet.sh
 scripts/serve-glm53-moet.sh
 ```
 
-The build compiles this source tree with the repository `vllm-openai` Docker
-target, then adds the SM120 cubins under `/cubit-share`. The serve script uses
-TP2, ModelOpt/Marlin, FP8 KV, the V2 runner, 32K context, one sequence, eager
+`scripts/build-glm53-moet.sh` builds only `Dockerfile.glm53-moet`, overlaying
+this source tree's Python files onto the pinned vLLM image
+(`vllm/vllm-openai:glm53-flash@sha256:2c6da6c6f16ed15c91e412d896dba13701f25fe1861eaec9ddaa4db34d1d21c4`),
+then adds the SM120 cubins under `/cubit-share`. The serve script uses TP2,
+ModelOpt/Marlin, FP8 KV, the V2 runner, 32K context, one sequence, eager
 execution, reasoning parser `glm45`, and tool parser `glm47`.
+
+## Published container image
+
+`ghcr.io/sepffuzzball/vllm-glm53-moet:latest` is published to GHCR by
+`.github/workflows/publish-glm53-moet-image.yml`, which is also reachable from
+GitHub's "Run workflow" button (`workflow_dispatch`) for manual builds. The
+image is built for `linux/amd64` only (the included cubins are SM120-only).
+`latest` tracks the default branch; tag pushes add a `v*` tag and every push
+adds a `sha-<short>` tag.
+
+The first GHCR publication is private by GitHub design; the workflow does not
+change visibility. After the first publish, open
+`https://github.com/users/sepffuzzball/packages/container/vllm-glm53-moet/settings`
+once and choose Change visibility -> Public. `latest` is anonymously pullable
+only after that one-time change; subsequent tags remain public.
+
+To pull it:
+
+```bash
+docker pull ghcr.io/sepffuzzball/vllm-glm53-moet:latest
+```
+
+The previous script rebuilt the complete vLLM native image from source
+(`docker/Dockerfile`, target `vllm-openai`) and could take hours. The current
+build instead overlays Python onto the exact pinned base image, so it should be
+mostly the base-image download plus a small overlay. If you already started an
+old full source build (for example, it is at Docker build step 67 or 89), you
+can stop it and just rerun `scripts/build-glm53-moet.sh`.
+
+This overlay is ABI-safe only while the pinned base image and this source tree
+are built from the same vLLM commit: the base image's compiled `.so`
+extensions are reused as-is, so the overlaid Python must match their ABI. The
+pinned base digest is recorded in `MOET_PROVENANCE.md`.
 
 ## Geometry and memory model
 
@@ -60,9 +95,10 @@ correctness from cache behavior.
 MOET_PROFILE=resident scripts/serve-glm53-moet.sh
 ```
 
-Important overrides include `IMAGE`, `MODEL_PATH`, `HF_CACHE`, `PLANES_CACHE`,
-`MOE_STORE`, `BASE_CACHE_GB`, `BASE_RAM_GB`, `GPU_MEM_UTIL`,
-`MAX_BATCHED_TOKENS`, `PORT`, and `ENFORCE_EAGER=0`. Additional vLLM arguments
+Important overrides include `BASE_IMAGE` and `IMAGE` for the build script,
+`IMAGE`, `MODEL_PATH`, `HF_CACHE`, `PLANES_CACHE`, `MOE_STORE`,
+`BASE_CACHE_GB`, `BASE_RAM_GB`, `GPU_MEM_UTIL`, `MAX_BATCHED_TOKENS`,
+`PORT`, and `ENFORCE_EAGER=0` for the serve script. Additional vLLM arguments
 may be appended to the serve script.
 
 Use at least 192 GiB of system RAM for the cache profile and first conversion.
