@@ -664,6 +664,19 @@ class Worker(WorkerBase):
 
         with self._maybe_get_memory_pool_context(tag="kv_cache"):
             self.model_runner.initialize_kv_cache(kv_cache_config)
+            from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+
+            if moe_w2_delta._TIER is not None:
+                moe_w2_delta._TIER.finalize_auto()
+            if moe_w2_delta._BASE_TIER is not None:
+                moe_w2_delta._BASE_TIER.preload_pool()
+            moe_w2_delta.check_pool_floor(
+                top_k=self.model_config.get_num_experts_per_tok()
+                if self.model_config.is_moe
+                else 1,
+                n_spec=self.vllm_config.num_speculative_tokens,
+                max_num_seqs=self.vllm_config.scheduler_config.max_num_seqs,
+            )
 
         if self.model_config.enable_return_routed_experts:
             self.model_runner.init_routed_experts_capturer()
@@ -1349,10 +1362,26 @@ class Worker(WorkerBase):
         if weight_transfer_engine := getattr(self, "weight_transfer_engine", None):
             weight_transfer_engine.shutdown()
 
+        from vllm.model_executor.layers.quantization.utils import moe_w2_delta
+
+        moe_w2_delta.shutdown()
+
         # Release GPU resources held by the model runner so that memory
         # can be reclaimed when running in-process
         if model_runner := getattr(self, "model_runner", None):
             model_runner.shutdown()
+
+        from vllm.model_executor.layers.quantization.utils import (
+            moe_w2_cubit,
+            moe_w2_gate,
+            moe_w2_looka,
+            moe_w2_planes_cache,
+        )
+
+        moe_w2_planes_cache.shutdown()
+        moe_w2_gate.shutdown()
+        moe_w2_looka.shutdown()
+        moe_w2_cubit.shutdown()
 
         # Release kept-alive cumem pools while the pluggable allocator wrappers
         # and callbacks are still alive, so MemPool teardown is not deferred to

@@ -1,0 +1,9 @@
+ARG BASE_IMAGE=glm53-vllm-openai:base
+FROM ${BASE_IMAGE}
+
+COPY kernels/cubins-sm120/ /cubit-share/
+
+# Fail the build if any shipped cubin differs from the reviewed artifacts.
+RUN cd /cubit-share && sha256sum -c SHA256SUMS
+
+ENV VLLM_MOE_W2_CUBIT_DIR=/cubit-share

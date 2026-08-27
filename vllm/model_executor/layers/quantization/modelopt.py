@@ -8,6 +8,7 @@ import torch
 from torch.nn.parameter import Parameter
 
 import vllm.envs as envs
+import vllm.model_executor.layers.fused_moe.modular_kernel as mk
 from vllm.config import get_current_vllm_config
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.linear import (
@@ -1400,6 +1401,21 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
             self.nvfp4_backend
         )
 
+    def maybe_make_prepare_finalize(
+        self,
+        routing_tables: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> mk.FusedMoEPrepareAndFinalizeModular | None:
+        # VLLM_MOE_W2: the 2-bit path skips the stock kernel setup, so
+        # supports_internal_mk stays False and the runner's
+        # maybe_init_modular_kernel reaches this. Nothing to build (TP-only;
+        # apply() dispatches to moe_w2_forward) -> no-op instead of raising.
+        if getattr(self, "_moe_w2_active", False):
+            return None
+        raise ValueError(
+            f"{self.__class__.__name__} uses the new modular kernel initialization "
+            "logic. This function should not be called."
+        )
+
     def uses_weight_scale_2_pattern(self) -> bool:
         """
         FP4 variants use 'weight_scale_2' pattern for per-tensor weight scales.
@@ -1522,10 +1538,67 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         )
         layer.register_parameter("w2_input_scale", w2_input_scale)
 
+        # VLLM_MOE_W2: the raw NVFP4 checkpoint experts of all layers do not
+        # fit the GPU during load (GLM-5.2-NVFP4 ~380 GiB); move the big
+        # tensors' storage to host RAM until the 2-bit planes are built in
+        # process_weights_after_loading. Mutating .data keeps the vLLM
+        # parameter classes and their loader attributes intact (scale_2 /
+        # input_scale are tiny and stay put). Loader-level skip first: a
+        # layer the pack store already serves (boot-from-pack sidecar hit)
+        # needs NO checkpoint staging at all - plan_pack_skip stubs the big
+        # params and disarms their loaders, removing both the ~0.5 TB
+        # host-RAM transient and the staged copies (the intermittent-OOM /
+        # slow-boot root cause on GLM TP2).
+        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
+
+        if (
+            moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", ""))
+            and not moe_w2_cubit.plan_pack_skip(layer)
+            and not moe_w2_cubit.arm_stream_build(layer)
+        ):
+            # first boot / store miss: stream-build stages lazily
+            # (buffers materialize per layer as its tensors load,
+            # requant fires on the last, staging drops in place) -
+            # peak host RAM stays O(layers in flight), not
+            # O(checkpoint). Fallback: classic all-layers CPU staging.
+            for pname in (
+                "w13_weight",
+                "w13_weight_scale",
+                "w2_weight",
+                "w2_weight_scale",
+            ):
+                p_ = getattr(layer, pname)
+                p_.data = p_.data.cpu()
+
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
         """
         Convert NVFP4 MoE weights into kernel format and setup the kernel.
         """
+
+        # VLLM_MOE_W2: re-quantize the host-staged NVFP4 experts to 2-bit
+        # tensor-sym planes; skip the stock kernel setup entirely. Unlike
+        # the mxfp4/fp8 methods, this class raises in
+        # maybe_make_prepare_finalize (new-style internal-MK method) and
+        # its get_fused_moe_quant_config rebuilds a backend config from the
+        # (now stubbed) scale tensors - so pre-set a benign
+        # moe_quant_config (skips _ensure_moe_quant_config_ init) and flag
+        # the method so maybe_make_prepare_finalize no-ops.
+        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
+
+        if moe_w2_cubit.is_w2_layer(getattr(layer, "layer_name", "")):
+            from vllm.model_executor.layers.fused_moe.config import (
+                FUSED_MOE_UNQUANTIZED_CONFIG,
+            )
+
+            # the CREATE-time counter when the loader-skip planner ran
+            # (identical build order); len(_LAYERS) for older paths
+            key = getattr(layer, "_moe_w2_create_key", len(moe_w2_cubit._LAYERS))
+            if not getattr(layer, "_moe_w2_stream_built", False):
+                moe_w2_cubit.build_layer_planes_nvfp4(layer, key)
+            layer._moe_w2_key = key
+            self._moe_w2_active = True
+            self.moe_quant_config = FUSED_MOE_UNQUANTIZED_CONFIG
+            return
 
         # Use a single gscale for w13.
         if self.moe.is_act_and_mul and not torch.allclose(
@@ -1598,7 +1671,9 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
 
     @property
     def supports_eplb(self) -> bool:
-        return True
+        from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
+
+        return not moe_w2_cubit.enabled()
 
     def apply_monolithic(
         self,
@@ -1633,6 +1708,18 @@ class ModelOptNvFp4FusedMoE(FusedMoEMethodBase):
         shared_experts: SharedExperts | None,
         shared_experts_input: torch.Tensor | None,
     ) -> torch.Tensor:
+        # VLLM_MOE_W2: routed dispatch for 2-bit NVFP4 experts. Stock layers
+        # have no _moe_w2_key and fall through to the stock kernel below.
+        w2_key = getattr(layer, "_moe_w2_key", None)
+        if w2_key is not None:
+            from vllm.model_executor.layers.quantization.utils import moe_w2_cubit
+
+            if layer.expert_map is not None or layer.apply_router_weight_on_input:
+                raise RuntimeError(
+                    "VLLM_MOE_W2 does not support expert maps/EPLB or "
+                    "router-weight-on-input"
+                )
+            return moe_w2_cubit.moe_w2_forward(x, topk_weights, topk_ids, w2_key)
         assert not self.is_monolithic
         assert self.moe_kernel is not None
         return self.moe_kernel.apply(

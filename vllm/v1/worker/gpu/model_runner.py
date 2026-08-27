@@ -25,6 +25,7 @@ from typing import Any, NamedTuple
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 
 import vllm.envs as envs
@@ -34,6 +35,7 @@ from vllm.config.compilation import CUDAGraphMode
 from vllm.distributed.parallel_state import (
     get_dcp_group,
     get_pp_group,
+    get_tp_group,
 )
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
@@ -45,6 +47,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts_capturer import (
 from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
     initialize_mamba_ssu_backend,
 )
+from vllm.model_executor.layers.quantization.utils import moe_w2_delta
 from vllm.model_executor.model_loader import get_model_loader
 from vllm.model_executor.offloader import (
     create_offloader,
@@ -151,6 +154,53 @@ from vllm.v1.worker.utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _moe_w2_promote_consensus(
+    tier: Any,
+    tp_group: Any,
+    local_miss: int,
+    *,
+    pin: bool,
+    where: str,
+) -> None:
+    """TP-wide mandatory base-cache promotion, fail-closed.
+
+    Every rank passes the same already-reduced miss count so the collective
+    is well-formed. Ranks with a nonzero local miss force-promote the base
+    cache; the int32 success flag is MIN-all-reduced across the TP group,
+    so a single failed rank fails the step everywhere. On any failure,
+    raises with a message naming the phase so the step never replays or
+    returns zero-contribution logits from stale base weights.
+    """
+    error: BaseException | None = None
+    if local_miss > 0:
+        try:
+            tier.force_promote(max_promote=None, pin=pin)
+        except BaseException as exc:
+            error = exc
+
+    success = torch.tensor(1, dtype=torch.int32, device=tier.dev)
+    if error is not None:
+        success.fill_(0)
+    if tp_group.world_size > 1:
+        dist.all_reduce(
+            success,
+            op=dist.ReduceOp.MIN,
+            group=tp_group.device_group,
+        )
+
+    if error is not None or int(success.item()) == 0:
+        if error is not None:
+            raise RuntimeError(
+                "moe_w2 mandatory base-cache promotion failed before "
+                f"{where}: refusing to replay or return zero-contribution logits"
+            ) from error
+        raise RuntimeError(
+            "moe_w2 mandatory base-cache promotion failed before "
+            f"{where} on a peer rank: refusing to replay or return "
+            "zero-contribution logits"
+        )
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
@@ -1720,14 +1770,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         self.step_timing.forward_start()
 
         # Run model.
-        if batch_desc.cg_mode == CUDAGraphMode.FULL:
-            # Use explicit cudagraph replay for FULL mode.
-            # NOTE(woosuk): Here, we don't need to pass the input tensors,
-            # because they are already copied to the CUDA graph input buffers.
-            assert self.cudagraph_manager is not None
-            self.kv_connector.pre_forward(scheduler_output)
-            model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
-        else:
+        def _run_model(run_pre_forward: bool = False):
+            if batch_desc.cg_mode == CUDAGraphMode.FULL:
+                # Use explicit cudagraph replay for FULL mode.
+                # NOTE(woosuk): Here, we don't need to pass the input tensors,
+                # because they are already copied to the CUDA graph input buffers.
+                assert self.cudagraph_manager is not None
+                if run_pre_forward:
+                    self.kv_connector.pre_forward(scheduler_output)
+                return self.cudagraph_manager.run_fullgraph(batch_desc)
+
             # For piecewise and eager mode, just call model().
             batch_descriptor = BatchDescriptor(
                 num_tokens=input_batch.num_tokens_after_padding,
@@ -1746,18 +1798,79 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 skip_compiled=skip_compiled,
                 is_padding=input_batch.is_padding,
             ):
-                self.kv_connector.pre_forward(scheduler_output)
+                if run_pre_forward:
+                    self.kv_connector.pre_forward(scheduler_output)
                 if batch_desc.cg_mode == CUDAGraphMode.PIECEWISE:
                     # Run the PIECEWISE graph (compiled PW cudagraph or breakable
                     # cudagraph, chosen inside run_pw_graph). cg_mode is only
                     # PIECEWISE after the cudagraph manager exists.
                     assert self.cudagraph_manager is not None
-                    model_output = self.cudagraph_manager.run_pw_graph(
-                        self.model, model_inputs
-                    )
+                    return self.cudagraph_manager.run_pw_graph(self.model, model_inputs)
+
+                # Eager (NONE): call the raw model directly.
+                return self.model(**model_inputs)
+
+        base_tier = moe_w2_delta._BASE_TIER
+        tiers = []
+        for tier in (base_tier, moe_w2_delta._TIER):
+            if tier is not None and all(tier is not t for t in tiers):
+                tiers.append(tier)
+        if base_tier is not None and not dummy_run and get_pp_group().world_size > 1:
+            raise RuntimeError(
+                "moe_w2 base cache does not support pipeline parallelism"
+            )
+        if dummy_run:
+            model_output = _run_model(run_pre_forward=True)
+            for tier in tiers:
+                tier.seen.zero_()
+                if moe_w2_delta.STEP_W:
+                    tier.seen_w.zero_()
+            if base_tier is not None:
+                base_tier.miss_count.zero_()
+        else:
+            for tier in tiers:
+                tier.wait_manager_idle()
+            for tier in tiers:
+                tier.step_begin()
+            try:
+                if base_tier is None:
+                    model_output = _run_model(run_pre_forward=True)
                 else:
-                    # Eager (NONE): call the raw model directly.
-                    model_output = self.model(**model_inputs)
+
+                    def tp_max(miss: torch.Tensor) -> int:
+                        dist.all_reduce(
+                            miss,
+                            op=dist.ReduceOp.MAX,
+                            group=get_tp_group().device_group,
+                        )
+                        return int(miss.item())
+
+                    base_tier.miss_count.zero_()
+                    model_output = _run_model(run_pre_forward=True)
+                    max_miss = tp_max(base_tier.miss_count)
+                    initial_miss = max_miss
+                    pass_count = 0
+                    while max_miss > 0:
+                        replay = moe_w2_delta.fp_continue(pass_count, max_miss)
+                        _moe_w2_promote_consensus(
+                            base_tier,
+                            get_tp_group(),
+                            max_miss,
+                            pin=replay,
+                            where="TP base replay",
+                        )
+                        if not replay:
+                            break
+                        pass_count += 1
+                        base_tier.miss_count.zero_()
+                        model_output = _run_model()
+                        max_miss = tp_max(base_tier.miss_count)
+                    moe_w2_delta.fp_validate_complete(max_miss)
+                    base_tier.kpi_step(initial_miss, pass_count > 0)
+                    base_tier.kpi_fp(pass_count, max_miss)
+            finally:
+                for tier in reversed(tiers):
+                    tier.step_end()
 
         if self.is_last_pp_rank:
             if self.use_aux_hidden_state_outputs:

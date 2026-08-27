@@ -2178,9 +2178,22 @@ def is_set(name: str):
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
 
 
+_MOET_EXTENSION_ENV = "VLLM_MOE_W2"
+_MOET_EXTENSION_ENV_PREFIX = "VLLM_MOE_W2_"
+
+
+def _is_moet_extension_env(name: str) -> bool:
+    return name == _MOET_EXTENSION_ENV or name.startswith(
+        _MOET_EXTENSION_ENV_PREFIX)
+
+
 def validate_environ(hard_fail: bool) -> None:
     for env in os.environ:
         if env.startswith("VLLM_") and env not in environment_variables:
+            if _is_moet_extension_env(env):
+                # MOE-W2 extension vars are validated and hashed via
+                # compile_factors, so they are not unknown here.
+                continue
             if hard_fail:
                 raise ValueError(f"Unknown vLLM environment variable detected: {env}")
             else:
@@ -2292,6 +2305,10 @@ def compile_factors() -> dict[str, object]:
             continue
 
         factors[factor] = normalize_value(raw)
+
+    for env in os.environ:
+        if _is_moet_extension_env(env):
+            factors[env] = normalize_value(os.getenv(env))
 
     ray_noset_env_vars = [
         # Refer to
